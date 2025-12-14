@@ -4,6 +4,15 @@ import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from tqdm import tqdm
+import pickle
+
+# --- Гиперпараметры ---
+LAMBDA = 5.0  # Параметр из твоего уравнения
+ITERATIONS = 5000
+LR = 0.001
+N_PHYS = 10000 # Точек внутри
+N_BOUND = 2500 # Точек на одной стороне границы
+MODEL_NAME = "2_7_7_1"
 
 # Выбираем устройство (GPU если есть, иначе CPU)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -94,55 +103,68 @@ def compute_pde_residual(model, x, y, lambda_param=1.0):
     
     return residual
 
-# --- Гиперпараметры ---
-LAMBDA = 5.0  # Параметр из твоего уравнения
-ITERATIONS = 5000
-LR = 0.001
-N_PHYS = 10000 # Точек внутри
-N_BOUND = 2500 # Точек на одной стороне границы
-
-# Инициализация модели и оптимизатора
 model = PINN().to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 
-# Генерируем данные один раз (можно и на каждой итерации, но так быстрее)
-x_p, y_p, xy_b = generate_data(N_PHYS, N_BOUND)
+try:
+    print("Есть ли сохраненная модель?")
+    model.load_state_dict(torch.load(f"{MODEL_NAME}.pth"))
+    print("Модель загружена.")
+    print("Загружаем loss_histroy...")
+    with open(f"{MODEL_NAME}_loss_history.pkl", 'rb') as f:
+        loss_history = pickle.load(f)
+    print(f"История лоссов успешно загружена")
+except FileNotFoundError:
+    print("Сохраненная модель не найдена.")
 
-loss_history = []
+    # Генерируем данные один раз (можно и на каждой итерации, но так быстрее)
+    x_p, y_p, xy_b = generate_data(N_PHYS, N_BOUND)
 
-print("Начинаем обучение...")
+    loss_history = []
 
-for epoch in tqdm(range(ITERATIONS)):
-    optimizer.zero_grad()
-    
-    # --- 1. Потеря на уравнении (Physics Loss) ---
-    res = compute_pde_residual(model, x_p, y_p, LAMBDA)
-    loss_physics = torch.mean(res ** 2)
-    
-    # --- 2. Потеря на границах (Boundary Loss) ---
-    # Граничные точки у нас в одном тензоре (N, 2), разделим для подачи в сеть
-    x_b = xy_b[:, 0:1]
-    y_b = xy_b[:, 1:2]
-    
-    u_boundary_pred = model(x_b, y_b)
-    # Мы хотим, чтобы u на границе было равно 0
-    u_boundary_target = torch.zeros_like(u_boundary_pred)
-    # loss_boundary = torch.mean((u_boundary_pred - u_boundary_target) ** 2)
-    loss_boundary = torch.mean((u_boundary_pred) ** 2)
-    
-    # --- 3. Общая потеря ---
-    # Иногда граничному условию дают больший вес, например 10 * loss_boundary
-    loss = loss_physics + loss_boundary
-    
-    loss.backward()
-    optimizer.step()
-    
-    loss_history.append(loss.item())
-    
-    # if epoch % 500 == 0:
-    #     print(f"Epoch {epoch}: Loss = {loss.item():.6f} (Phys: {loss_physics.item():.6f}, BC: {loss_boundary.item():.6f})")
+    print("Начинаем обучение...")
 
-print("Обучение завершено.")
+    for epoch in tqdm(range(ITERATIONS)):
+        optimizer.zero_grad()
+        
+        # --- 1. Потеря на уравнении (Physics Loss) ---
+        res = compute_pde_residual(model, x_p, y_p, LAMBDA)
+        loss_physics = torch.mean(res ** 2)
+        
+        # --- 2. Потеря на границах (Boundary Loss) ---
+        # Граничные точки у нас в одном тензоре (N, 2), разделим для подачи в сеть
+        x_b = xy_b[:, 0:1]
+        y_b = xy_b[:, 1:2]
+        
+        u_boundary_pred = model(x_b, y_b)
+        # Мы хотим, чтобы u на границе было равно 0
+        u_boundary_target = torch.zeros_like(u_boundary_pred)
+        # loss_boundary = torch.mean((u_boundary_pred - u_boundary_target) ** 2)
+        loss_boundary = torch.mean((u_boundary_pred) ** 2)
+        
+        # --- 3. Общая потеря ---
+        # Иногда граничному условию дают больший вес, например 10 * loss_boundary
+        loss = loss_physics + loss_boundary
+        
+        loss.backward()
+        optimizer.step()
+        
+        loss_history.append(loss.item())
+        
+        # if epoch % 500 == 0:
+        #     print(f"Epoch {epoch}: Loss = {loss.item():.6f} (Phys: {loss_physics.item():.6f}, BC: {loss_boundary.item():.6f})")
+    print(f"Сохраняем модель как {MODEL_NAME}.pth")
+    torch.save(model.state_dict(), f"{MODEL_NAME}.pth")
+    print(f"Модель сохранена как {MODEL_NAME}.pth")
+
+    print(f"Сохраняем loss_history как {MODEL_NAME}_loss_history.pkl")
+
+    with open(f"{MODEL_NAME}_loss_history.pkl", 'wb') as f:
+        # 'wb' означает 'write binary' (запись в бинарном режиме)
+        pickle.dump(loss_history, f)
+
+    print(f"История лоссов сохранена как {MODEL_NAME}_loss_history.pkl")
+    print("Обучение завершено.")
 
 # Создаем сетку для рисования
 x_vals = np.linspace(0, 1, 100)
@@ -227,5 +249,3 @@ plt.tight_layout()
 # plt.show()
 plt.savefig('pinn_solution_3d.png')
 
-PATH = '2_7_7_1.pth'
-torch.save(model.state_dict(), PATH)
