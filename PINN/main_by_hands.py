@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 from tqdm import tqdm
 
 # Выбираем устройство (GPU если есть, иначе CPU)
@@ -182,6 +183,49 @@ plt.ylabel('Loss (log scale)')
 plt.tight_layout()
 # plt.show()
 plt.savefig('pinn_solution.png')
+
+# --- Визуализация 3D ---
+
+# 1. Создаем плотную сетку для плавности графика
+x_vals = np.linspace(0, 1, 100)
+y_vals = np.linspace(0, 1, 100)
+X, Y = np.meshgrid(x_vals, y_vals)
+
+# 2. Переводим сетку в тензоры PyTorch
+# flatten() вытягивает матрицу в линию, reshape(-1, 1) делает столбец
+x_grid = torch.tensor(X.flatten(), dtype=torch.float32).reshape(-1, 1).to(device)
+y_grid = torch.tensor(Y.flatten(), dtype=torch.float32).reshape(-1, 1).to(device)
+
+# 3. Получаем предсказания модели
+model.eval() # Переводим модель в режим оценки (на всякий случай)
+with torch.no_grad():
+    u_pred = model(x_grid, y_grid)
+    # Возвращаем форму обратно в (100, 100) для рисования
+    Z = u_pred.cpu().numpy().reshape(100, 100)
+
+# 4. Рисуем 3D график
+fig = plt.figure(figsize=(12, 8))
+ax = fig.add_subplot(111, projection='3d') # Создаем 3D оси
+
+# plot_surface создает поверхность
+# cmap='jet' или 'viridis' задают цветовую схему
+surf = ax.plot_surface(X, Y, Z, cmap='jet', edgecolor='none', alpha=0.9)
+
+# Подписи осей
+ax.set_xlabel('X coordinate')
+ax.set_ylabel('Y coordinate')
+ax.set_zlabel('u(x, y)')
+ax.set_title(f'3D Solution of PINN (lambda={LAMBDA})')
+
+# Добавляем цветовую шкалу справа
+fig.colorbar(surf, ax=ax, shrink=0.5, aspect=10, label='Amplitude u')
+
+# Можно повернуть камеру, чтобы лучше рассмотреть форму
+# ax.view_init(elev=30, azim=45) # elev - наклон, azim - поворот
+
+plt.tight_layout()
+# plt.show()
+plt.savefig('pinn_solution_3d.png')
 
 PATH = '2_7_7_1.pth'
 torch.save(model.state_dict(), PATH)
