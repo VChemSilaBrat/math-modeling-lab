@@ -2,24 +2,26 @@ import torch
 import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
+# from mpl_toolkits.mplot3d import Axes3D
 from tqdm import tqdm
 import pickle
+import copy
 
 # --- Гиперпараметры ---
-LAMBDA = 5.0  # Параметр из твоего уравнения
-ITERATIONS = 5000
+ITERATIONS = 5000   # Итераций на каждую точку кривой
 LR = 0.001
 N_PHYS = 10000 # Точек внутри
 N_BOUND = 2500 # Точек на одной стороне границы
-MODEL_NAME = "2_7_7_1"
+DS = 0.1            # Длина шага по дуге (Arc Length step)
+N_STEPS = 40        # Сколько точек бифуркационной кривой ищем
+MODEL_NAME = "2_7_7_1_bif"
 
 # Выбираем устройство (GPU если есть, иначе CPU)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Используем устройство: {device}")
 
 class PINN(nn.Module):
-    def __init__(self):
+    def __init__(self, init_lambda=0.0):
         super(PINN, self).__init__()
         # Полносвязная сеть:
         # Вход (2) -> Скрытый (32) -> ... -> Выход (1)
@@ -33,6 +35,7 @@ class PINN(nn.Module):
             nn.Linear(7, 1)
         )
         # веса были выбраны в соотвествии с Table 2 из статьи по PINN
+        self.lam = nn.Parameter(torch.tensor([init_lambda], dtype=torch.float32))
 
     def forward(self, x, y):
         # Объединяем x и y в один тензор размером (N, 2)
@@ -73,10 +76,10 @@ def generate_data(n_physics, n_boundary):
     
     return x_phys, y_phys, boundary_points
 
-def compute_pde_residual(model, x, y, lambda_param=1.0):
+def compute_pde_residual(model, x, y):
     # 1. Предсказание сети u(x, y)
     u = model(x, y)
-    
+    lambda_param = model.lam
     # 2. Первые производные du/dx и du/dy
     # grad возвращает кортеж, берем [0]
     u_x = torch.autograd.grad(u, x, 
@@ -103,149 +106,180 @@ def compute_pde_residual(model, x, y, lambda_param=1.0):
     
     return residual
 
-model = PINN().to(device)
+def get_anchor_points(n=1000):
+    x = torch.rand((n, 1)).to(device)
+    y = torch.rand((n, 1)).to(device)
+    return x, y
+
+x_anchor, y_anchor = get_anchor_points(N_PHYS)
+
+# Генерируем данные один раз (можно и на каждой итерации, но так быстрее)
+x_p, y_p, xy_b = generate_data(N_PHYS, N_BOUND)
+
+history_lambda = []
+history_u_max = []
+
+print(">>> Step 0: Initial solution at lambda=0...")
+model = PINN(init_lambda=0.0).to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+# Замораживаем лямбду для первого шага, чтобы найти точное решение именно для lambda=0
+model.lam.requires_grad = False
+
+for i in tqdm(range(ITERATIONS)):
+    optimizer.zero_grad()
+    
+    res = compute_pde_residual(model, x_p, y_p)
+    loss_phys = torch.mean(res**2)
+    
+    u_b = model(xy_b[:,0:1], xy_b[:,1:2])
+    loss_b = torch.mean(u_b**2)
+    
+    loss = loss_phys + 10 * loss_b # Вес граничных условий побольше
+    loss.backward()
+    optimizer.step()
+
+# Сохраняем "предыдущее" состояние (u_prev, lambda_prev)
+# Для u_prev мы просто запокаем предсказания на якорных точках
+with torch.no_grad():
+    u_prev = model(x_anchor, y_anchor)
+    lam_prev = model.lam.item()
+    max_val = u_prev.max().item()
+
+history_lambda.append(lam_prev)
+history_u_max.append(max_val)
+
+print(f"Start Point: Lambda={lam_prev:.4f}, Max|u|={max_val:.4f}")
+
+# --- ШАГ 1: Вторая точка (нужна для вектора направления) ---
+# Чуть сдвинем лямбду и дообучим, чтобы получить направление касательной
+print(">>> Step 1: Second solution at lambda=0.5 (to get direction)...")
+model.lam.requires_grad = False
+model.lam.data = torch.tensor([0.5]).to(device) # Принудительно ставим сдвиг
+
+optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+for i in tqdm(range(ITERATIONS)):
+    optimizer.zero_grad()
+    res = compute_pde_residual(model, x_p, y_p)
+    loss_phys = torch.mean(res**2)
+    u_b = model(xy_b[:,0:1], xy_b[:,1:2])
+    loss_b = torch.mean(u_b**2)
+    loss = loss_phys + 10 * loss_b
+    loss.backward()
+    optimizer.step()
+
+with torch.no_grad():
+    u_curr = model(x_anchor, y_anchor)
+    lam_curr = model.lam.item()
+    max_val = u_curr.max().item()
+
+history_lambda.append(lam_curr)
+history_u_max.append(max_val)
+print(f"Second Point: Lambda={lam_curr:.4f}, Max|u|={max_val:.4f}")
+
+# Теперь у нас есть две точки, мы можем вычислить касательную (тангенс)
+# Tangent vector: t = (u_curr - u_prev, lam_curr - lam_prev)
+# Но нужно нормализовать
+
+# --- ШАГ 2: ЦИКЛ ПО ДЛИНЕ ДУГИ (Pseudo-Arclength Loop) ---
+print(f">>> Continuation process for {N_STEPS} steps...")
+
+# Теперь Лямбда должна меняться
+model.lam.requires_grad = True
+# Создаем новый оптимизатор, который включает model.lam
 optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 
-try:
-    print("Есть ли сохраненная модель?")
-    model.load_state_dict(torch.load(f"{MODEL_NAME}.pth"))
-    print("Модель загружена.")
-    print("Загружаем loss_histroy...")
-    with open(f"{MODEL_NAME}_loss_history.pkl", 'rb') as f:
-        loss_history = pickle.load(f)
-    print(f"История лоссов успешно загружена")
-except FileNotFoundError:
-    print("Сохраненная модель не найдена.")
+# Переменные для хранения "предыдущего" шага для цикла
+u_prev_vec = u_curr.clone()   # Вектор значений u на anchor точках
+lam_prev_val = lam_curr
 
-    # Генерируем данные один раз (можно и на каждой итерации, но так быстрее)
-    x_p, y_p, xy_b = generate_data(N_PHYS, N_BOUND)
+for step in range(N_STEPS):
+    # 1. Вычисляем касательную (направление secant)
+    # diff_u имеет размер (N_anchor, 1)
+    diff_u = u_prev_vec - u_prev_vec 
+    diff_lam = lam_prev_val - lam_prev_val
 
-    loss_history = []
+    # Нормализация касательной
+    # Скалярное произведение для функций считаем как среднее (или интеграл)
+    # Norm^2 = <du, du> + dlam^2
+    norm = torch.sqrt(torch.mean(diff_u**2) + diff_lam**2)
+    
+    tau_u = diff_u / norm       # Компонента касательной по u
+    tau_lam = diff_lam / norm   # Компонента касательной по lambda
 
-    print("Начинаем обучение...")
+    # 2. ПРЕДСКАЗАНИЕ (Predictor)
+    # Делаем линейный шаг вдоль касательной
+    # u_guess = u_prev + DS * tau
+    # lam_guess = lam_prev + DS * tau
+    
+    # Прямая манипуляция весами модели сложна для предиктора, 
+    # поэтому мы просто устанавливаем начальное значение лямбды, 
+    # а веса сети оставим с прошлого шага (это работает как "близкое" приближение).
+    # Но лямбду сдвинем явно:
+    with torch.no_grad():
+        model.lam.data += DS * tau_lam 
+        # Если бы мы могли легко сдвинуть веса сети вдоль tau_u, мы бы сделали это,
+        # но для NN это сложно, поэтому надеемся, что оптимизатор дотянет.
 
-    for epoch in tqdm(range(ITERATIONS)):
+    # 3. КОРРЕКЦИЯ (Corrector) - Обучение PINN
+    # Теперь ищем решение, которое удовлетворяет PDE и находится на расстоянии DS 
+    # от (u_prev_vec, lam_prev_val) в направлении касательной.
+    
+    pbar = tqdm(range(ITERATIONS), leave=False)
+
+    for i in pbar:
         optimizer.zero_grad()
         
-        # --- 1. Потеря на уравнении (Physics Loss) ---
-        res = compute_pde_residual(model, x_p, y_p, LAMBDA)
-        loss_physics = torch.mean(res ** 2)
+        # A. PDE Loss
+        res = compute_pde_residual(model, x_p, y_p)
+        loss_pde = torch.mean(res**2)
         
-        # --- 2. Потеря на границах (Boundary Loss) ---
-        # Граничные точки у нас в одном тензоре (N, 2), разделим для подачи в сеть
-        x_b = xy_b[:, 0:1]
-        y_b = xy_b[:, 1:2]
+        # B. Boundary Loss
+        u_b = model(xy_b[:,0:1], xy_b[:,1:2])
+        loss_b = torch.mean(u_b**2)
         
-        u_boundary_pred = model(x_b, y_b)
-        # Мы хотим, чтобы u на границе было равно 0
-        u_boundary_target = torch.zeros_like(u_boundary_pred)
-        # loss_boundary = torch.mean((u_boundary_pred - u_boundary_target) ** 2)
-        loss_boundary = torch.mean((u_boundary_pred) ** 2)
+        # C. Arclength Loss (Constraint)
+        # Уравнение: <u - u_prev, tau_u> + (lam - lam_prev)*tau_lam - DS = 0
+        u_anchor_pred = model(x_anchor, y_anchor)
         
-        # --- 3. Общая потеря ---
-        # Иногда граничному условию дают больший вес, например 10 * loss_boundary
-        loss = loss_physics + loss_boundary
+        # Скалярное произведение функций (approximation via mean)
+        dot_u = torch.mean((u_anchor_pred - u_prev_vec) * tau_u)
+        dot_lam = (model.lam - lam_prev_val) * tau_lam
+        
+        # Мы хотим, чтобы (dot_u + dot_lam) == DS
+        loss_arc = ((dot_u + dot_lam) - DS) ** 2
+        
+        # Суммарный лосс
+        loss = loss_pde + 10 * loss_b + 10 * loss_arc
         
         loss.backward()
         optimizer.step()
+
+        if i % 500 == 0:
+            pbar.set_description(f"S:{step} L:{model.lam.item():.2f} Loss:{loss.item():.5f}")
+
+    # 4. Сохранение результатов шага
+    with torch.no_grad():
+        u_new_vec = model(x_anchor, y_anchor)
+        lam_new_val = model.lam.item()
         
-        loss_history.append(loss.item())
+        # Обновляем историю
+        history_lambda.append(lam_new_val)
+        history_u_max.append(u_new_vec.max().item())
         
-        # if epoch % 500 == 0:
-        #     print(f"Epoch {epoch}: Loss = {loss.item():.6f} (Phys: {loss_physics.item():.6f}, BC: {loss_boundary.item():.6f})")
-    print(f"Сохраняем модель как {MODEL_NAME}.pth")
-    torch.save(model.state_dict(), f"{MODEL_NAME}.pth")
-    print(f"Модель сохранена как {MODEL_NAME}.pth")
+        # Сдвигаем буферы для следующего шага
+        u_pprev_vec = u_prev_vec.clone()
+        lam_pprev_val = lam_prev_val
+        
+        u_prev_vec = u_new_vec.clone()
+        lam_prev_val = lam_new_val
+        
+    print(f"Step {step+1}: Lambda={lam_new_val:.4f}, Max|u|={u_new_vec.max().item():.4f}")
 
-    print(f"Сохраняем loss_history как {MODEL_NAME}_loss_history.pkl")
-
-    with open(f"{MODEL_NAME}_loss_history.pkl", 'wb') as f:
-        # 'wb' означает 'write binary' (запись в бинарном режиме)
-        pickle.dump(loss_history, f)
-
-    print(f"История лоссов сохранена как {MODEL_NAME}_loss_history.pkl")
-    print("Обучение завершено.")
-
-# Создаем сетку для рисования
-x_vals = np.linspace(0, 1, 100)
-y_vals = np.linspace(0, 1, 100)
-X, Y = np.meshgrid(x_vals, y_vals)
-
-# Преобразуем в тензоры для PyTorch
-x_grid = torch.tensor(X.flatten(), dtype=torch.float32).reshape(-1, 1).to(device)
-y_grid = torch.tensor(Y.flatten(), dtype=torch.float32).reshape(-1, 1).to(device)
-
-# Предсказываем (отключаем расчет градиентов для скорости)
-with torch.no_grad():
-    u_pred = model(x_grid, y_grid)
-    u_pred = u_pred.cpu().numpy().reshape(100, 100)
-
-final_loss = loss_history[-1]
-
-# Рисуем
-plt.figure(figsize=(12, 5))
-
-# График 1: Тепловая карта решения
-plt.subplot(1, 2, 1)
-plt.pcolormesh(X, Y, u_pred, cmap='jet', shading='auto')
-plt.colorbar(label='u(x, y)')
-plt.title(f'PINN Solution (lambda={LAMBDA})')
-plt.xlabel('x')
-plt.ylabel('y')
-
-# График 2: Кривая падения ошибки (Loss)
-plt.subplot(1, 2, 2)
-plt.plot(loss_history)
-plt.yscale('log')
-plt.title('Loss History')
-plt.text(0.5, 0.9, f'Final Loss: {final_loss:.6f}', transform=plt.gca().transAxes, fontsize=12, ha='center')
-plt.xlabel('Epoch')
-plt.ylabel('Loss (log scale)')
-
-plt.tight_layout()
-# plt.show()
-plt.savefig('pinn_solution.png')
-
-# --- Визуализация 3D ---
-
-# 1. Создаем плотную сетку для плавности графика
-x_vals = np.linspace(0, 1, 100)
-y_vals = np.linspace(0, 1, 100)
-X, Y = np.meshgrid(x_vals, y_vals)
-
-# 2. Переводим сетку в тензоры PyTorch
-# flatten() вытягивает матрицу в линию, reshape(-1, 1) делает столбец
-x_grid = torch.tensor(X.flatten(), dtype=torch.float32).reshape(-1, 1).to(device)
-y_grid = torch.tensor(Y.flatten(), dtype=torch.float32).reshape(-1, 1).to(device)
-
-# 3. Получаем предсказания модели
-model.eval() # Переводим модель в режим оценки (на всякий случай)
-with torch.no_grad():
-    u_pred = model(x_grid, y_grid)
-    # Возвращаем форму обратно в (100, 100) для рисования
-    Z = u_pred.cpu().numpy().reshape(100, 100)
-
-# 4. Рисуем 3D график
-fig = plt.figure(figsize=(12, 8))
-ax = fig.add_subplot(111, projection='3d') # Создаем 3D оси
-
-# plot_surface создает поверхность
-# cmap='jet' или 'viridis' задают цветовую схему
-surf = ax.plot_surface(X, Y, Z, cmap='jet', edgecolor='none', alpha=0.9)
-
-# Подписи осей
-ax.set_xlabel('X coordinate')
-ax.set_ylabel('Y coordinate')
-ax.set_zlabel('u(x, y)')
-ax.set_title(f'3D Solution of PINN (lambda={LAMBDA})')
-
-# Добавляем цветовую шкалу справа
-fig.colorbar(surf, ax=ax, shrink=0.5, aspect=10, label='Amplitude u')
-
-# Можно повернуть камеру, чтобы лучше рассмотреть форму
-# ax.view_init(elev=30, azim=45) # elev - наклон, azim - поворот
-
-plt.tight_layout()
-# plt.show()
-plt.savefig('pinn_solution_3d.png')
-
+plt.figure(figsize=(8, 6))
+plt.plot(history_lambda, history_u_max, '-o', markersize=4, label='PINN Bifurcation Path')
+plt.xlabel(r'$\lambda$')
+plt.ylabel(r'$max|u|$')
+plt.title('Bifurcation Diagram via Pseudo-Arclength Continuation')
+plt.grid(True)
+plt.savefig('bifurcation_diagram.png')
+print("Диаграмма сохранена как bifurcation_diagram.png")
