@@ -11,7 +11,6 @@ N_PHYS = 10000
 N_BOUND = 2500
 DS = 0.1
 N_STEPS = 40
-MODEL_NAME = "2_7_7_1_bif"
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Используем устройство: {device}")
@@ -97,7 +96,7 @@ history_lambda = []
 history_u_max = []
 
 print(">>> Step 0: Initial solution at lambda=0...")
-model = PINN(init_lambda=0.0).to(device)
+model = PINN(init_lambda=-2.5).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 model.lam.requires_grad = False
 
@@ -125,7 +124,7 @@ print(f"Start Point: Lambda={lam_prev:.4f}, Max|u|={max_val:.4f}")
 
 # --- ШАГ 1: Вторая точка ---
 print(">>> Step 1: Second solution at lambda=0.5...")
-model.lam.data = torch.tensor([0.5], device=device)
+model.lam.data = torch.tensor([-2.0], device=device)
 
 optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 for i in tqdm(range(ITERATIONS)):
